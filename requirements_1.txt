@@ -9,4 +9,3 @@ scipy
 nbformat
 jupyter
 ipykernel
-shap
