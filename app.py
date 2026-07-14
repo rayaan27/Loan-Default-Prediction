@@ -18,7 +18,7 @@ def load_artifacts():
     scaler = joblib.load('models/scaler.pkl')
     kmeans = joblib.load('models/kmeans_model.pkl')
     best_model = joblib.load('models/best_model.pkl')
-    shap_explainer = joblib.load('models/shap_explainer.pkl')
+    shap_explainer = shap.TreeExplainer(best_model, feature_perturbation='tree_path_dependent')
     features_a = joblib.load('models/features_a.pkl')
     features_b = joblib.load('models/features_b.pkl')
     return scaler, kmeans, best_model, shap_explainer, features_a, features_b
