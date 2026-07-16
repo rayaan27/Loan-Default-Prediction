@@ -6,6 +6,7 @@ Run with: python test_pipeline.py
 import joblib
 import pandas as pd
 import numpy as np
+import json
 
 # ---- Load everything the pipeline needs ----
 scaler = joblib.load('models/scaler.pkl')
@@ -14,6 +15,12 @@ best_model = joblib.load('models/best_model.pkl')
 shap_explainer = joblib.load('models/shap_explainer.pkl')
 features_a = joblib.load('models/features_a.pkl')
 features_b = joblib.load('models/features_b.pkl')
+
+with open('models/decision_threshold.json') as f:
+    threshold_data = json.load(f)
+# adjust the key name below to match what your JSON actually contains
+DECISION_THRESHOLD = threshold_data.get('threshold', threshold_data.get('Threshold', 0.18))
+REVIEW_MARGIN = 0.05  # narrow buffer just below the calibrated cutoff
 
 numeric_cols = ['Age', 'Income', 'LoanAmount', 'CreditScore', 'MonthsEmployed',
                 'NumCreditLines', 'InterestRate', 'LoanTerm', 'DTIRatio']
@@ -68,6 +75,8 @@ def match_category(user_value, column_name):
 
 def get_user_input():
     print("\n--- Enter Applicant Details ---")
+    print("(This tool is designed for a lender evaluating a loan applicant's default risk.)")
+    print("(Categorical answers are not case-sensitive and punctuation doesn't matter)\n")
 
     age = get_int_input("Applicant's Age: ")
     income = get_float_input("Applicant's Monthly Income: ")
@@ -83,7 +92,7 @@ def get_user_input():
     print("auto loans, store cards, etc. all count as one line each).")
     num_credit_lines = get_int_input("Number of Credit Lines: ")
 
-    
+    print("\nInterest Rate is the rate being offered on this loan (set by the lender, not the applicant).")
     interest_rate = get_float_input("Interest Rate for this loan offer (e.g. 12.5 for 12.5%): ")
     loan_term = get_int_input("Loan Term in months (e.g. 36): ")
 
@@ -145,16 +154,26 @@ def run_pipeline(new_input_raw):
     new_encoded_B = new_encoded_B[features_b]
 
     # Predict
-    prediction = best_model.predict(new_encoded_B)[0]
     proba_default = best_model.predict_proba(new_encoded_B)[0][1]
 
-    # Show confidence in whichever label was actually predicted, not always P(Default)
-    if prediction == 1:
-        predicted_label = "DEFAULT"
-        confidence = proba_default
+    # Three-tier decision based on the calibrated threshold loaded from disk,
+    # with a narrow review band just below it (same narrow-band philosophy as before,
+    # re-centered around the new calibrated cutoff instead of the default 50%)
+    if proba_default < APPROVE_CUTOFF:
+        decision = "APPROVED"
+    elif proba_default < DENY_CUTOFF:
+        decision = "FLAGGED FOR REVIEW"
     else:
-        predicted_label = "NO DEFAULT"
+        decision = "DENIED"
+
+    # Confidence shown reflects how far the probability sits from the boundary,
+    # framed relative to the tier assigned
+    if decision == "DENIED":
+        confidence = proba_default
+    elif decision == "APPROVED":
         confidence = 1 - proba_default
+    else:
+        confidence = proba_default  # shown as P(Default) directly while under review
 
     # SHAP explanation
     shap_vals = shap_explainer.shap_values(new_encoded_B, check_additivity=False)
@@ -170,10 +189,10 @@ def run_pipeline(new_input_raw):
         'SHAP Contribution': shap_vals
     }).sort_values(by='SHAP Contribution', key=abs, ascending=False)
 
-    return cluster_id, predicted_label, confidence, contribution
+    return cluster_id, decision, proba_default, confidence, contribution
 
 
-def explain_in_plain_language(contribution_df, target_coverage=0.85):
+def explain_in_plain_language(contribution_df, target_coverage=0.87):
     """
     Converts raw SHAP contributions into a human-readable summary.
     Includes as many top features as needed to cover roughly target_coverage
@@ -239,11 +258,17 @@ def explain_in_plain_language(contribution_df, target_coverage=0.85):
 
 if __name__ == "__main__":
     new_input_raw = get_user_input()
-    cluster_id, predicted_label, confidence, contribution = run_pipeline(new_input_raw)
+    cluster_id, decision, proba_default, confidence, contribution = run_pipeline(new_input_raw)
 
     print("\n" + "=" * 50)
-    print(f"Prediction: {predicted_label}")
-    print(f"Confidence: {confidence:.2%}")
+    print(f"Decision: {decision}")
+    if decision == "FLAGGED FOR REVIEW":
+        print(f"Probability of Default: {proba_default:.2%} "
+              f"(within the {APPROVE_CUTOFF:.0%}-{DENY_CUTOFF:.0%} review band)")
+        print("This applicant falls in a borderline range and should be manually reviewed")
+        print("rather than automatically approved or denied.")
+    else:
+        print(f"Confidence: {confidence:.2%}")
     print("=" * 50)
 
     explain_in_plain_language(contribution, target_coverage=0.87)

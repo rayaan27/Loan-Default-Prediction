@@ -3,6 +3,7 @@ Loan Default Prediction - Streamlit App
 Run with: streamlit run app.py
 """
 
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,10 +19,36 @@ def load_artifacts():
     scaler = joblib.load('models/scaler.pkl')
     kmeans = joblib.load('models/kmeans_model.pkl')
     best_model = joblib.load('models/best_model.pkl')
-    shap_explainer = shap.TreeExplainer(best_model, feature_perturbation='tree_path_dependent')
     features_a = joblib.load('models/features_a.pkl')
     features_b = joblib.load('models/features_b.pkl')
+
+    # FIX: best_model is a CalibratedClassifierCV wrapper around XGBoost.
+    # shap.TreeExplainer cannot read the wrapper directly (InvalidModelError),
+    # so we pull out the underlying tree model and explain that instead.
+    # Calibration is a monotonic post-processing step, so relative feature
+    # importance from the base model remains meaningful.
+    try:
+        base_model = best_model.calibrated_classifiers_[0].estimator
+    except AttributeError:
+        # older scikit-learn versions name this attribute differently
+        base_model = best_model.calibrated_classifiers_[0].base_estimator
+
+    shap_explainer = shap.TreeExplainer(base_model, feature_perturbation='tree_path_dependent')
+
     return scaler, kmeans, best_model, shap_explainer, features_a, features_b
+
+
+@st.cache_resource
+def load_decision_thresholds():
+    # FIX: three-tier Approve/Review/Deny cutoffs, produced by threshold tuning.
+    # Falls back to sane defaults if the file is missing so the app doesn't crash.
+    try:
+        with open('models/decision_threshold.json', 'r') as f:
+            thresholds = json.load(f)
+    except FileNotFoundError:
+        thresholds = {"review_threshold": 0.10, "deny_threshold": 0.18}
+    return thresholds
+
 
 @st.cache_data
 def load_data():
@@ -29,14 +56,21 @@ def load_data():
     comparison_df = pd.read_csv('data/model_comparison.csv')
     return df_clusters, comparison_df
 
+
 @st.cache_resource
 def load_global_shap():
-    shap_vals_global = joblib.load('models/shap_summary_values.pkl')
+    shap_vals_global = np.load('models/shap_values_summary.npy')
     shap_sample = pd.read_csv('data/shap_summary_sample.csv')
+    shap_vals_global = shap_vals_global[:len(shap_sample)]
     return shap_vals_global, shap_sample
 
+
 scaler, kmeans, best_model, shap_explainer, features_a, features_b = load_artifacts()
+decision_thresholds = load_decision_thresholds()
 df_clusters, comparison_df = load_data()
+
+REVIEW_THRESHOLD = decision_thresholds.get("review_threshold", 0.3)
+DENY_THRESHOLD = decision_thresholds.get("deny_threshold", 0.6)
 
 numeric_cols = ['Age', 'Income', 'LoanAmount', 'CreditScore', 'MonthsEmployed',
                 'NumCreditLines', 'InterestRate', 'LoanTerm', 'DTIRatio']
@@ -86,6 +120,16 @@ def get_feature_label(feature, value):
         label_if_1, label_if_0 = BINARY_FEATURE_LABELS[feature]
         return label_if_1 if value == 1 else label_if_0
     return FRIENDLY_NAMES.get(feature, feature)
+
+
+def get_decision(proba_default):
+    """FIX: three-tier Approve/Review/Deny decision based on tuned thresholds."""
+    if proba_default >= DENY_THRESHOLD:
+        return "DENY"
+    elif proba_default >= REVIEW_THRESHOLD:
+        return "REVIEW"
+    else:
+        return "APPROVE"
 
 
 # Clearer segment naming + a plain description of what it means for the applicant
@@ -239,13 +283,11 @@ def predict_page():
         new_encoded_B['Cluster_ID'] = cluster_id
         new_encoded_B = new_encoded_B[features_b]
 
-        prediction = best_model.predict(new_encoded_B)[0]
         proba_default = best_model.predict_proba(new_encoded_B)[0][1]
 
-        if prediction == 1:
-            predicted_label, confidence = "DEFAULT", proba_default
-        else:
-            predicted_label, confidence = "NO DEFAULT", 1 - proba_default
+        # FIX: three-tier Approve/Review/Deny decision instead of binary DEFAULT/NO DEFAULT
+        decision = get_decision(proba_default)
+        confidence = proba_default if decision == "DENY" else 1 - proba_default
 
         shap_vals = shap_explainer.shap_values(new_encoded_B, check_additivity=False)
         shap_vals = np.array(shap_vals)
@@ -273,7 +315,8 @@ def predict_page():
         # Store everything needed to redraw the result, so it survives reruns on this page
         st.session_state['prediction_result'] = {
             'applicant_name': applicant_name,
-            'predicted_label': predicted_label,
+            'decision': decision,
+            'proba_default': proba_default,
             'confidence': confidence,
             'cluster_id': int(cluster_id),
             'top_features': top_features.to_dict('records'),
@@ -286,23 +329,18 @@ def predict_page():
         st.divider()
         result_col1, result_col2 = st.columns(2)
         with result_col1:
-            if result['predicted_label'] == "DEFAULT":
-                st.error(f"### Prediction: {result['predicted_label']}")
+            # FIX: three-tier decision display
+            if result['decision'] == "DENY":
+                st.error(f"### Decision: {result['decision']}")
+            elif result['decision'] == "REVIEW":
+                st.warning(f"### Decision: {result['decision']}")
             else:
-                st.success(f"### Prediction: {result['predicted_label']}")
-            st.metric("Confidence", f"{result['confidence']:.1%}")
-        with result_col2:
-            group_name, group_desc = CLUSTER_INFO.get(result['cluster_id'], (f"Group {result['cluster_id']}", ""))
-            st.info(f"**Applicant Group: {group_name}**\n\n{group_desc}")
+                st.success(f"### Decision: {result['decision']}")
+            st.metric("Probability of Default", f"{result['proba_default']:.1%}")
+        
+        
 
-        st.caption(
-            "Note: the Applicant Group reflects a broad historical pattern for similar borrowers. "
-            "The prediction above is based on this specific applicant's full profile, so it can differ "
-            "from what the group's general trend would suggest — just as one person can outperform or "
-            "underperform the average for their group."
-        )
-
-        st.subheader("Why this prediction?")
+        st.subheader("Why this decision?")
         total_share = sum(f['Share'] for f in result['top_features'])
         st.caption(f"The following {len(result['top_features'])} factor(s) account for about "
                    f"{total_share:.0%} of the model's decision.")
@@ -317,7 +355,7 @@ def predict_page():
         if st.button("Save Record"):
             record = {
                 'Applicant Name': result['applicant_name'] if result['applicant_name'] else "Unnamed",
-                'Prediction': result['predicted_label'],
+                'Decision': result['decision'],
                 'Confidence': f"{result['confidence']:.1%}",
                 'Applicant Group': CLUSTER_INFO.get(result['cluster_id'], (f"Group {result['cluster_id']}",))[0],
                 'Top Factors': "; ".join(
@@ -348,9 +386,13 @@ def predict_page():
         else:
             for idx in reversed(saved_records.index):
                 row = saved_records.loc[idx]
+                # FIX: old rows saved before this change used a 'Prediction' column
+                # instead of 'Decision'. Fall back gracefully instead of KeyError-ing.
+                decision_label = row['Decision'] if 'Decision' in saved_records.columns and pd.notna(row.get('Decision')) \
+                    else row.get('Prediction', 'N/A')
                 card_col1, card_col2 = st.columns([5, 1])
                 with card_col1:
-                    st.markdown(f"**{row['Applicant Name']}** — {row['Prediction']} ({row['Confidence']})")
+                    st.markdown(f"**{row['Applicant Name']}** — {decision_label} ({row['Confidence']})")
                     st.caption(f"Applicant Group: {row['Applicant Group']}")
                     for factor in str(row['Top Factors']).split("; "):
                         st.markdown(f"- {factor}")
